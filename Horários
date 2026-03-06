@@ -1,0 +1,350 @@
+# ===============================
+# INSTALAÇÃO
+# ===============================
+!pip install ortools pandas gspread oauth2client openpyxl
+
+# ===============================
+# IMPORTAÇÕES
+# ===============================
+import pandas as pd
+from ortools.sat.python import cp_model
+from google.colab import auth
+import gspread
+from google.auth import default
+
+# ===============================
+# CONFIGURAÇÕES
+# ===============================
+PLANILHA_ID = '1qU7o4rn4519AYh890E93iCigdw3PLgNDd6tHevab8JU'
+
+DIAS_MAP = {
+    'Segunda':0,'Terça':1,'Quarta':2,'Quinta':3,'Sexta':4,
+    'Segunda-feira':0,'Terça-feira':1,'Quarta-feira':2,
+    'Quinta-feira':3,'Sexta-feira':4
+}
+
+DIAS_NOMES = ['Segunda','Terça','Quarta','Quinta','Sexta']
+
+AULAS_DIA = 4
+DIAS = range(5)
+HORARIOS = range(AULAS_DIA)
+
+# ===============================
+# CARREGAR DADOS DO SHEETS
+# ===============================
+def carregar_dados_sheets(id_planilha):
+    auth.authenticate_user()
+    creds,_ = default()
+    gc = gspread.authorize(creds)
+    planilha = gc.open_by_key(id_planilha)
+    df_matriz = pd.DataFrame(planilha.worksheet('Matriz_Curricular').get_all_records())
+    df_profs = pd.DataFrame(planilha.worksheet('Professores').get_all_records())
+    # Limpeza básica
+    df_matriz['Professor_ID'] = df_matriz['Professor_ID'].str.strip()
+    df_profs['Professor_ID'] = df_profs['Professor_ID'].str.strip()
+    return df_matriz, df_profs, gc
+
+# ===============================
+# INTERPRETAR INDISPONIBILIDADE
+# ===============================
+def interpretar_indisponibilidade(texto):
+    if pd.isna(texto) or str(texto).strip()=="":
+        return [],[]
+    dias_bloqueados=[]
+    aulas_bloqueadas=[]
+    itens=str(texto).split(',')
+    for item in itens:
+        item=item.strip()
+        texto_parte=""
+        numero_parte=""
+        for c in item:
+            if c.isdigit():
+                numero_parte+=c
+            else:
+                texto_parte+=c
+        texto_parte=texto_parte.strip().capitalize()
+        if texto_parte not in DIAS_MAP:
+            continue
+        d=DIAS_MAP[texto_parte]
+        if numero_parte=="":
+            dias_bloqueados.append(d)
+        else:
+            for digito in numero_parte:
+                aula=int(digito)-1
+                aulas_bloqueadas.append((d,aula))
+    return dias_bloqueados,aulas_bloqueadas
+
+# ===============================
+# DIAGNÓSTICO DE INVIABILIDADE
+# ===============================
+def diagnostico(df_matriz, df_profs):
+    print("\n" + "="*50)
+    print("🔍 DIAGNÓSTICO PRELIMINAR")
+    print("="*50)
+
+    # 1. Carga por professor vs máximo
+    print("\n📊 CARGA POR PROFESSOR:")
+    carga_prof = df_matriz.groupby("Professor_ID")["Aulas_Semanais"].sum()
+    for _, prof in df_profs.iterrows():
+        pid = prof["Professor_ID"]
+        if pid not in carga_prof:
+            continue
+        carga = carga_prof[pid]
+        maximo = prof["Max_Aulas_Semana"]
+        if carga > maximo:
+            print(f"❌ {pid}: {carga} aulas > máximo {maximo} – SOBRECARGA")
+        else:
+            print(f"✅ {pid}: {carga} aulas (máx {maximo})")
+
+    # 2. Carga total por turma (esperado 20)
+    print("\n🏫 CARGA POR TURMA (esperado 20):")
+    carga_turma = df_matriz.groupby("Turma")["Aulas_Semanais"].sum()
+    for turma, carga in carga_turma.items():
+        if carga != 20:
+            print(f"❌ Turma {turma}: {carga} aulas – diferente de 20")
+        else:
+            print(f"✅ Turma {turma}: {carga} aulas")
+
+    # 3. Paridade das cargas individuais
+    print("\n🔢 PARIDADE DAS CARGAS INDIVIDUAIS:")
+    for _, linha in df_matriz.iterrows():
+        if linha["Aulas_Semanais"] % 2 != 0:
+            print(f"⚠️  {linha['Professor_ID']} - {linha['Turma']}: {linha['Aulas_Semanais']} aulas (ímpar) – precisará compartilhar blocos.")
+
+    # 4. Paridade da carga total por turma
+    print("\n🔢 PARIDADE DA CARGA TOTAL POR TURMA:")
+    for turma in df_matriz["Turma"].unique():
+        total = df_matriz[df_matriz["Turma"] == turma]["Aulas_Semanais"].sum()
+        if total % 2 != 0:
+            print(f"❌ Turma {turma}: carga total {total} (ímpar) – inviável com blocos.")
+        else:
+            print(f"✅ Turma {turma}: carga total {total} (par)")
+
+    # 5. Disponibilidade de horários por professor (considerando folgas)
+    print("\n⏰ DISPONIBILIDADE DE HORÁRIOS POR PROFESSOR:")
+    total_periodos = len(DIAS) * len(HORARIOS)  # 20
+    for _, prof in df_profs.iterrows():
+        pid = prof["Professor_ID"]
+        dias_b, aulas_b = interpretar_indisponibilidade(prof.get("Dias_Folga", ""))
+        bloqueados = set()
+        for d in dias_b:
+            for h in HORARIOS:
+                bloqueados.add((d, h))
+        for d, h in aulas_b:
+            bloqueados.add((d, h))
+        disponiveis = total_periodos - len(bloqueados)
+        carga_total = df_matriz[df_matriz["Professor_ID"] == pid]["Aulas_Semanais"].sum()
+        if carga_total > disponiveis:
+            print(f"❌ {pid}: precisa de {carga_total} aulas, mas tem apenas {disponiveis} períodos livres (folgas: {bloqueados})")
+        else:
+            print(f"✅ {pid}: {carga_total} aulas, {disponiveis} períodos livres")
+
+    print("\n" + "="*50)
+    print("FIM DO DIAGNÓSTICO")
+    print("="*50 + "\n")
+
+# ===============================
+# OTIMIZAÇÃO
+# ===============================
+def otimizar_horario():
+    df_matriz, df_profs, gc = carregar_dados_sheets(PLANILHA_ID)
+
+    # Executa diagnóstico antes de construir o modelo
+    diagnostico(df_matriz, df_profs)
+
+    model = cp_model.CpModel()
+
+    turmas = df_matriz['Turma'].unique()
+    dias_idx = range(5)
+    horarios_total = range(4)
+
+    pares_validos = df_matriz[['Professor_ID','Turma','Aulas_Semanais']]
+
+    # -------------------------
+    # VARIÁVEIS
+    # -------------------------
+    x = {}
+    for _,linha in pares_validos.iterrows():
+        p = linha['Professor_ID'].strip()
+        t = linha['Turma']
+        for d in dias_idx:
+            for h in horarios_total:
+                x[(p, t, d, h)] = model.NewBoolVar(f'x_{p}_{t}_{d}_{h}')
+
+    # Dicionário de cargas por (p,t)
+    carga_pt = {}
+    for _, linha in pares_validos.iterrows():
+        p = linha['Professor_ID'].strip()
+        t = linha['Turma']
+        carga_pt[(p, t)] = linha['Aulas_Semanais']
+
+    # -------------------------
+    # RESTRIÇÕES DE GEMINAÇÃO E DISTRIBUIÇÃO DIÁRIA
+    # -------------------------
+    for (p, t), qtd in carga_pt.items():
+        if qtd % 2 == 0:  # Carga par: aulas sempre em blocos completos de 2 no mesmo dia
+            for d in dias_idx:
+                u = model.NewBoolVar(f'u_{p}_{t}_{d}')
+                model.Add(sum(x[(p, t, d, h)] for h in horarios_total) == 2 * u)
+                # Geminação dentro de cada bloco
+                model.Add(x[(p, t, d, 0)] == x[(p, t, d, 1)])
+                model.Add(x[(p, t, d, 2)] == x[(p, t, d, 3)])
+        else:  # Carga ímpar
+            for d in dias_idx:
+                # Variáveis indicadoras de bloco
+                b1 = model.NewBoolVar(f'b1_{p}_{t}_{d}')
+                b2 = model.NewBoolVar(f'b2_{p}_{t}_{d}')
+
+                # Soma no bloco 1 (horários 0 e 1)
+                soma_bloco1 = x[(p, t, d, 0)] + x[(p, t, d, 1)]
+                model.Add(soma_bloco1 >= 1).OnlyEnforceIf(b1)
+                model.Add(soma_bloco1 == 0).OnlyEnforceIf(b1.Not())
+
+                # Soma no bloco 2 (horários 2 e 3)
+                soma_bloco2 = x[(p, t, d, 2)] + x[(p, t, d, 3)]
+                model.Add(soma_bloco2 >= 1).OnlyEnforceIf(b2)
+                model.Add(soma_bloco2 == 0).OnlyEnforceIf(b2.Not())
+
+                # Não pode ter aulas nos dois blocos no mesmo dia
+                model.Add(b1 + b2 <= 1)
+
+                # Limite diário (já será reforçado globalmente, mas opcional)
+                model.Add(soma_bloco1 + soma_bloco2 <= 2)
+
+            # Número máximo de dias com aula = (qtd+1)//2 (para 3: 2, para 1: 1)
+            u_dict = {}
+            for d in dias_idx:
+                u = model.NewBoolVar(f'u_{p}_{t}_{d}')
+                u_dict[d] = u
+                soma_dia = sum(x[(p, t, d, h)] for h in horarios_total)
+                model.Add(soma_dia >= u)
+                model.Add(soma_dia <= 2 * u)
+            model.Add(sum(u_dict.values()) <= (qtd + 1) // 2)
+
+    # -------------------------
+    # CARGA HORÁRIA (exata)
+    # -------------------------
+    for _,linha in pares_validos.iterrows():
+        p = linha['Professor_ID'].strip()
+        t = linha['Turma']
+        qtd = linha['Aulas_Semanais']
+        model.Add(sum(x[(p,t,d,h)] for d in dias_idx for h in horarios_total) == qtd)
+
+    # -------------------------
+    # FOLGAS
+    # -------------------------
+    for _,prof in df_profs.iterrows():
+        p_id = prof['Professor_ID'].strip()
+        dias_bloq, aulas_bloq = interpretar_indisponibilidade(prof['Dias_Folga'])
+        turmas_prof = pares_validos[pares_validos['Professor_ID'].str.strip() == p_id]['Turma'].unique()
+
+        # dia inteiro
+        for d in dias_bloq:
+            model.Add(sum(x[(p_id, t, d, h)] for t in turmas_prof for h in horarios_total) == 0)
+
+        # aula específica
+        for (d, h) in aulas_bloq:
+            for t in turmas_prof:
+                model.Add(x[(p_id, t, d, h)] == 0)
+
+    # -------------------------
+    # CONFLITOS
+    # -------------------------
+    for d in dias_idx:
+        for h in horarios_total:
+            # professor em duas turmas
+            for p in df_profs['Professor_ID'].str.strip():
+                turmas_prof = pares_validos[pares_validos['Professor_ID'].str.strip() == p]['Turma'].unique()
+                model.AddAtMostOne(x[(p, t, d, h)] for t in turmas_prof)
+
+            # turma com dois professores
+            for t in turmas:
+                profs_turma = pares_validos[pares_validos['Turma'] == t]['Professor_ID'].str.strip().unique()
+                model.AddAtMostOne(x[(p, t, d, h)] for p in profs_turma)
+
+    # -------------------------
+    # BLOCOS DE 2 AULAS POR TURMA (geminados na turma)
+    # -------------------------
+    for t in turmas:
+        profs_turma = pares_validos[pares_validos['Turma'] == t]['Professor_ID'].str.strip().unique()
+        for d in dias_idx:
+            # Horários 0 e 1
+            soma0 = sum(x[(p, t, d, 0)] for p in profs_turma)
+            soma1 = sum(x[(p, t, d, 1)] for p in profs_turma)
+            model.Add(soma0 == soma1)
+            # Horários 2 e 3
+            soma2 = sum(x[(p, t, d, 2)] for p in profs_turma)
+            soma3 = sum(x[(p, t, d, 3)] for p in profs_turma)
+            model.Add(soma2 == soma3)
+
+    # -------------------------
+    # CARGA DIÁRIA POR TURMA (exatamente 4 aulas por dia)
+    # -------------------------
+    for t in turmas:
+        profs_turma = pares_validos[pares_validos['Turma'] == t]['Professor_ID'].str.strip().unique()
+        for d in dias_idx:
+            total_dia = sum(x[(p, t, d, h)] for p in profs_turma for h in horarios_total)
+            model.Add(total_dia == 4)
+
+    # -------------------------
+    # SOLVER
+    # -------------------------
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 60
+
+    status = solver.Solve(model)
+
+    # -------------------------
+    # EXPORTAR PLANILHA
+    # -------------------------
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        print("\n✅ Horário gerado com sucesso!")
+
+        nova_planilha = gc.create("Horario_Escolar")
+
+        aba_geral = nova_planilha.sheet1
+        aba_geral.update([["HORÁRIOS GERAIS"]])
+
+        linha_atual = 3
+
+        for t in turmas:
+            grade = pd.DataFrame(
+                '',
+                index=[f'{i+1}ª aula' for i in range(4)],
+                columns=DIAS_NOMES
+            )
+
+            for (p, turma, d, h), var in x.items():
+                if solver.Value(var) == 1 and turma == t:
+                    grade.iloc[h, d] = p
+
+            aba_geral.update(f"A{linha_atual}", [[f"TURMA {t}"]])
+            linha_atual += 1
+
+            tabela = (
+                [["Aula"] + DIAS_NOMES] +
+                [[idx] + list(grade.loc[idx]) for idx in grade.index]
+            )
+
+            aba_geral.update(f"A{linha_atual}", tabela)
+            linha_atual += len(tabela) + 2
+
+            # aba individual
+            aba = nova_planilha.add_worksheet(title=t, rows=10, cols=10)
+            aba.update(tabela)
+
+        print("\nPlanilha criada no Google Drive")
+        print(nova_planilha.url)
+
+    else:
+        print("\n❌ MODELO INVIÁVEL")
+        print("Revise as mensagens de diagnóstico acima para ajustar os dados ou as restrições.")
+        print("\nEstatísticas do solver:")
+        print(f"  - Conflitos: {solver.NumConflicts()}")
+        print(f"  - Branches : {solver.NumBranches()}")
+        print(f"  - Tempo    : {solver.WallTime():.2f} s")
+
+# ===============================
+# EXECUTAR
+# ===============================
+otimizar_horario()
