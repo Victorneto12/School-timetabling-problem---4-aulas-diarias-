@@ -302,11 +302,11 @@ def otimizar_horario():
 
         nova_planilha = gc.create("Horario_Escolar")
 
-        aba_geral = nova_planilha.sheet1
-        aba_geral.update([["HORÁRIOS GERAIS"]])
+        # --- Aba principal: horários de todas as turmas ---
+        aba_principal = nova_planilha.sheet1
+        aba_principal.update([["HORÁRIOS DAS TURMAS"]])
 
-        linha_atual = 3
-
+        linha_atual = 2
         for t in turmas:
             grade = pd.DataFrame(
                 '',
@@ -318,20 +318,46 @@ def otimizar_horario():
                 if solver.Value(var) == 1 and turma == t:
                     grade.iloc[h, d] = p
 
-            aba_geral.update(f"A{linha_atual}", [[f"TURMA {t}"]])
+            # Cabeçalho da turma
+            aba_principal.update(f"A{linha_atual}", [[f"TURMA {t}"]])
             linha_atual += 1
 
+            # Tabela da turma
             tabela = (
                 [["Aula"] + DIAS_NOMES] +
                 [[idx] + list(grade.loc[idx]) for idx in grade.index]
             )
+            aba_principal.update(f"A{linha_atual}", tabela)
+            linha_atual += len(tabela) + 2  # espaço entre turmas
 
-            aba_geral.update(f"A{linha_atual}", tabela)
-            linha_atual += len(tabela) + 2
+        # --- Aba única para todos os professores (com linhas suficientes) ---
+        aba_profs = nova_planilha.add_worksheet(title="Professores", rows=1000, cols=10)
 
-            # aba individual
-            aba = nova_planilha.add_worksheet(title=t, rows=10, cols=10)
-            aba.update(tabela)
+        linha_prof = 1
+        for _, prof in df_profs.iterrows():
+            pid = prof['Professor_ID']
+            # Cabeçalho do professor
+            aba_profs.update(f"A{linha_prof}", [[f"Professor: {pid}"]])
+            linha_prof += 1
+
+            # Grade do professor (4 aulas x 5 dias)
+            grade_prof = pd.DataFrame(
+                "PLAN",
+                index=[f'{i+1}ª aula' for i in range(4)],
+                columns=DIAS_NOMES
+            )
+
+            for (p, turma, d, h), var in x.items():
+                if solver.Value(var) == 1 and p == pid:
+                    grade_prof.iloc[h, d] = turma
+
+            # Monta tabela do professor
+            tabela_prof = (
+                [["Aula"] + DIAS_NOMES] +
+                [[idx] + list(grade_prof.loc[idx]) for idx in grade_prof.index]
+            )
+            aba_profs.update(f"A{linha_prof}", tabela_prof)
+            linha_prof += len(tabela_prof) + 2  # espaço entre professores
 
         print("\nPlanilha criada no Google Drive")
         print(nova_planilha.url)
