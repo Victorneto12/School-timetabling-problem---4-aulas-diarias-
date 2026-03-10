@@ -15,7 +15,7 @@ from google.auth import default
 # ===============================
 # CONFIGURAÇÕES
 # ===============================
-PLANILHA_ID = '1qU7o4rn4519AYh890E93iCigdw3PLgNDd6tHevab8JU'
+PLANILHA_ID = '1V0eabg6fwYcHfVTAIQjQcH0c9rA4np38RSgJ3mzSU2g'
 
 DIAS_MAP = {
     'Segunda':0,'Terça':1,'Quarta':2,'Quinta':3,'Sexta':4,
@@ -28,6 +28,20 @@ DIAS_NOMES = ['Segunda','Terça','Quarta','Quinta','Sexta']
 AULAS_DIA = 4
 DIAS = range(5)
 HORARIOS = range(AULAS_DIA)
+
+# Cores predefinidas (RGB) para os professores – paleta suave
+CORES = [
+    (0.98, 0.9, 0.9),   # vermelho claro
+    (0.9, 0.98, 0.9),   # verde claro
+    (0.9, 0.9, 0.98),   # azul claro
+    (0.98, 0.98, 0.8),  # amarelo claro
+    (0.98, 0.8, 0.98),  # rosa claro
+    (0.8, 0.98, 0.98),  # ciano claro
+    (0.98, 0.85, 0.7),  # laranja claro
+    (0.85, 0.7, 0.98),  # lavanda
+    (0.7, 0.98, 0.85),  # menta
+    (0.98, 0.7, 0.7),   # salmão
+]
 
 # ===============================
 # CARREGAR DADOS DO SHEETS
@@ -139,9 +153,95 @@ def diagnostico(df_matriz, df_profs):
         else:
             print(f"✅ {pid}: {carga_total} aulas, {disponiveis} períodos livres")
 
+    # 6. NOVO: Verificar se existe dia sem nenhum professor disponível para uma turma
+    print("\n📅 VERIFICAÇÃO DE DIAS COMPLETAMENTE BLOQUEADOS POR TURMA:")
+    # Pré-processar indisponibilidades por professor
+    prof_bloqueios = {}
+    for _, prof in df_profs.iterrows():
+        pid = prof["Professor_ID"]
+        dias_b, aulas_b = interpretar_indisponibilidade(prof.get("Dias_Folga", ""))
+        bloqueados_por_dia = {d: set() for d in DIAS}
+        # Dias inteiros bloqueados
+        for d in dias_b:
+            for h in HORARIOS:
+                bloqueados_por_dia[d].add(h)
+        # Horários específicos bloqueados
+        for d, h in aulas_b:
+            bloqueados_por_dia[d].add(h)
+        prof_bloqueios[pid] = bloqueados_por_dia
+
+    turmas = df_matriz["Turma"].unique()
+    for turma in turmas:
+        profs_turma = df_matriz[df_matriz["Turma"] == turma]["Professor_ID"].unique()
+        for d in DIAS:
+            # Verifica se todos os professores estão completamente indisponíveis neste dia
+            todos_bloqueados = True
+            for pid in profs_turma:
+                if pid not in prof_bloqueios:
+                    continue
+                # Se o professor tem menos de 4 horários bloqueados neste dia, ele pode dar aula (ao menos 1 período livre)
+                if len(prof_bloqueios[pid][d]) < 4:
+                    todos_bloqueados = False
+                    break
+            if todos_bloqueados and len(profs_turma) > 0:
+                print(f"❌ Turma {turma} não tem nenhum professor disponível na {DIAS_NOMES[d]} – INVIAVEL")
+
     print("\n" + "="*50)
     print("FIM DO DIAGNÓSTICO")
     print("="*50 + "\n")
+
+# ===============================
+# FUNÇÃO PARA APLICAR CORES NA ABA PROFESSORES
+# ===============================
+def aplicar_cores_professores(spreadsheet, professores_info):
+    """
+    professores_info: lista de dicionários com:
+        - nome: str
+        - linha_inicio: int (linha do cabeçalho do professor)
+        - grade: pd.DataFrame (4x5) com os valores (já escritos)
+    """
+    ws = spreadsheet.worksheet("Professores")
+    sheet_id = ws.id
+
+    requests = []
+    for idx, info in enumerate(professores_info):
+        nome_prof = info['nome']
+        linha_base = info['linha_inicio']  # linha onde está o cabeçalho
+        grade = info['grade']  # DataFrame 4x5
+
+        r, g, b = CORES[idx % len(CORES)]
+        color = {
+            "red": r,
+            "green": g,
+            "blue": b
+        }
+
+        for i_aula in range(4):
+            linha = linha_base + 2 + i_aula  # linha no sheet
+            for j_dia in range(5):
+                valor = grade.iloc[i_aula, j_dia]
+                if valor != "PLAN":
+                    requests.append({
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": linha - 1,
+                                "endRowIndex": linha,
+                                "startColumnIndex": j_dia + 1,  # col B = índice 1
+                                "endColumnIndex": j_dia + 2,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "backgroundColor": color
+                                }
+                            },
+                            "fields": "userEnteredFormat.backgroundColor"
+                        }
+                    })
+
+    if requests:
+        spreadsheet.batch_update({"requests": requests})
+        print(f"✅ Formatação aplicada em {len(requests)} células.")
 
 # ===============================
 # OTIMIZAÇÃO
@@ -334,7 +434,9 @@ def otimizar_horario():
         aba_profs = nova_planilha.add_worksheet(title="Professores", rows=1000, cols=10)
 
         linha_prof = 1
-        for _, prof in df_profs.iterrows():
+        professores_info = []  # para guardar dados da formatação
+
+        for idx, (_, prof) in enumerate(df_profs.iterrows()):
             pid = prof['Professor_ID']
             # Cabeçalho do professor
             aba_profs.update(f"A{linha_prof}", [[f"Professor: {pid}"]])
@@ -357,7 +459,18 @@ def otimizar_horario():
                 [[idx] + list(grade_prof.loc[idx]) for idx in grade_prof.index]
             )
             aba_profs.update(f"A{linha_prof}", tabela_prof)
+
+            # Guarda informações para colorir
+            professores_info.append({
+                'nome': pid,
+                'linha_inicio': linha_prof - 1,  # linha onde está o cabeçalho do professor
+                'grade': grade_prof
+            })
+
             linha_prof += len(tabela_prof) + 2  # espaço entre professores
+
+        # Aplica cores na aba professores (usando o método batch_update da planilha)
+        aplicar_cores_professores(nova_planilha, professores_info)
 
         print("\nPlanilha criada no Google Drive")
         print(nova_planilha.url)
