@@ -15,7 +15,7 @@ from google.auth import default
 # ===============================
 # CONFIGURAÇÕES
 # ===============================
-PLANILHA_ID = '1V0eabg6fwYcHfVTAIQjQcH0c9rA4np38RSgJ3mzSU2g'
+PLANILHA_ID = '1qU7o4rn4519AYh890E93iCigdw3PLgNDd6tHevab8JU'
 
 DIAS_MAP = {
     'Segunda':0,'Terça':1,'Quarta':2,'Quinta':3,'Sexta':4,
@@ -482,6 +482,74 @@ def otimizar_horario():
         print(f"  - Conflitos: {solver.NumConflicts()}")
         print(f"  - Branches : {solver.NumBranches()}")
         print(f"  - Tempo    : {solver.WallTime():.2f} s")
+
+        # ===============================
+        # DIAGNÓSTICO ADICIONAL: TESTAR CADA TURMA ISOLADAMENTE
+        # ===============================
+        print("\n" + "="*50)
+        print("🔍 DIAGNÓSTICO DE TURMAS ISOLADAS")
+        print("="*50)
+
+        # Pré-processar indisponibilidades por professor
+        prof_bloqueios = {}
+        for _, prof in df_profs.iterrows():
+            pid = prof["Professor_ID"]
+            dias_b, aulas_b = interpretar_indisponibilidade(prof.get("Dias_Folga", ""))
+            bloqueados_por_dia = {d: set() for d in DIAS}
+            for d in dias_b:
+                for h in HORARIOS:
+                    bloqueados_por_dia[d].add(h)
+            for d, h in aulas_b:
+                bloqueados_por_dia[d].add(h)
+            prof_bloqueios[pid] = bloqueados_por_dia
+
+        for turma in turmas:
+            print(f"\n--- Testando turma {turma} ---")
+            df_turma = df_matriz[df_matriz["Turma"] == turma]
+            profs_turma = df_turma["Professor_ID"].unique()
+            cargas = {row["Professor_ID"]: row["Aulas_Semanais"] for _, row in df_turma.iterrows()}
+
+            model_turma = cp_model.CpModel()
+            y = {}
+            for pid in profs_turma:
+                for d in DIAS:
+                    for h in HORARIOS:
+                        y[(pid, d, h)] = model_turma.NewBoolVar(f'y_{pid}_{d}_{h}')
+
+            # Restrições de carga
+            for pid, qtd in cargas.items():
+                model_turma.Add(sum(y[(pid, d, h)] for d in DIAS for h in HORARIOS) == qtd)
+
+            # Restrições de disponibilidade
+            for pid in profs_turma:
+                bloqueios = prof_bloqueios.get(pid, {d: set() for d in DIAS})
+                for d in DIAS:
+                    for h in HORARIOS:
+                        if h in bloqueios[d]:
+                            model_turma.Add(y[(pid, d, h)] == 0)
+
+            # Restrições diárias: no máximo 3 aulas por professor na mesma turma por dia
+            for pid in profs_turma:
+                for d in DIAS:
+                    model_turma.Add(sum(y[(pid, d, h)] for h in HORARIOS) <= 3)
+
+            # Restrições da turma: exatamente 4 aulas por dia
+            for d in DIAS:
+                model_turma.Add(sum(y[(pid, d, h)] for pid in profs_turma for h in HORARIOS) == 4)
+
+            solver_turma = cp_model.CpSolver()
+            solver_turma.parameters.max_time_in_seconds = 10
+            status_turma = solver_turma.Solve(model_turma)
+
+            if status_turma in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                print(f"✅ Turma {turma} é viável isoladamente.")
+            else:
+                print(f"❌ Turma {turma} é inviável mesmo isoladamente!")
+                print("   Possíveis causas: falta de professores disponíveis em algum dia para fechar 4 aulas, ou carga incompatível com disponibilidades.")
+
+        print("\n" + "="*50)
+        print("FIM DO DIAGNÓSTICO DE TURMAS ISOLADAS")
+        print("="*50 + "\n")
 
 # ===============================
 # EXECUTAR
